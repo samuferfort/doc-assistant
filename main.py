@@ -29,10 +29,12 @@ embeddings = OpenAIEmbeddings(
     api_key=os.getenv("OPENAI_API_KEY"), model="text-embedding-3-small"
 )
 
+
 @app.get("/health")
 async def health_check():
     """Check if the service is running"""
     return {"status": "healthy"}
+
 
 @app.post("/process")
 async def process_document(
@@ -82,11 +84,9 @@ async def process_document(
                 doc.metadata.update(metadata_dict)
                 # Add a unique chunk ID for Pinecone
                 chunk_id = f"{project_id}_{file.filename}_{i}"
-                chunks.append({
-                    "id": chunk_id,
-                    "text": doc.page_content,
-                    "metadata": doc.metadata
-                })
+                chunks.append(
+                    {"id": chunk_id, "text": doc.page_content, "metadata": doc.metadata}
+                )
                 texts.append(doc.page_content)
 
             # Batch embed all texts
@@ -96,7 +96,7 @@ async def process_document(
             return {
                 "chunks": chunks,
                 "embeddings": embeddings_list,
-                "count": len(documents)
+                "count": len(documents),
             }
 
         finally:
@@ -108,6 +108,7 @@ async def process_document(
         raise HTTPException(
             status_code=500, detail=f"Error processing document: {str(e)}"
         )
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
