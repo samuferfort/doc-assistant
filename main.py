@@ -3,11 +3,20 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import tempfile
 import os
+import traceback
+import logging
 from dotenv import load_dotenv
 from typing import Optional
 import json
 from langchain_unstructured.document_loaders import UnstructuredLoader
 from langchain_openai import OpenAIEmbeddings
+import pypdf
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -29,12 +38,25 @@ embeddings = OpenAIEmbeddings(
     api_key=os.getenv("OPENAI_API_KEY"), model="text-embedding-3-small"
 )
 
-
 @app.get("/health")
 async def health_check():
     """Check if the service is running"""
     return {"status": "healthy"}
 
+def extract_text_with_pypdf(file_path):
+    """Extract text using PyPDF as a fallback method"""
+    logger.info("Attempting text extraction with PyPDF")
+    try:
+        reader = pypdf.PdfReader(file_path)
+        text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n\n"
+        return text
+    except Exception as e:
+        logger.error(f"PyPDF extraction error: {str(e)}")
+        return ""
 
 @app.post("/process")
 async def process_document(
@@ -67,15 +89,52 @@ async def process_document(
             temp_path = temp.name
 
         try:
-            # Process with UnstructuredLoader
-            loader = UnstructuredLoader(
-                temp_path,
-                strategy=strategy,
-                chunking_strategy="by_title",
-                max_characters=2000,
-                new_after_n_chars=1500,
-            )
-            documents = loader.load()
+            logger.info(f"Processing file: {file.filename} with strategy: {strategy}")
+            logger.info(f"Temp file path: {temp_path}")
+            
+            documents = []
+            
+            # First try with UnstructuredLoader
+            try:
+                loader = UnstructuredLoader(
+                    temp_path,
+                    strategy=strategy,
+                    chunking_strategy="by_title",
+                    max_characters=2000,
+                    new_after_n_chars=1500,
+                )
+                logger.info("UnstructuredLoader initialized successfully")
+                
+                documents = loader.load()
+                logger.info(f"Document loading complete. Extracted {len(documents)} chunks.")
+                
+            except Exception as loader_error:
+                logger.error(f"Error during document loading: {str(loader_error)}")
+                logger.error(traceback.format_exc())
+            
+            # If UnstructuredLoader failed or returned no chunks, try PyPDF
+            if len(documents) == 0:
+                logger.info("UnstructuredLoader returned no chunks, trying PyPDF fallback")
+                extracted_text = extract_text_with_pypdf(temp_path)
+                
+                if extracted_text:
+                    logger.info(f"PyPDF extracted {len(extracted_text)} characters")
+                    
+                    # Split the text into chunks
+                    text_splitter = RecursiveCharacterTextSplitter(
+                        chunk_size=2000,
+                        chunk_overlap=200,
+                        separators=["\n\n", "\n", " ", ""]
+                    )
+                    
+                    # Create document chunks
+                    from langchain_core.documents import Document
+                    full_doc = Document(page_content=extracted_text, metadata=metadata_dict)
+                    documents = text_splitter.split_documents([full_doc])
+                    
+                    logger.info(f"Split into {len(documents)} chunks using text splitter")
+                else:
+                    logger.warning("PyPDF fallback also failed to extract text")
 
             # Prepare chunks and batch embeddings
             chunks = []
@@ -89,8 +148,20 @@ async def process_document(
                 )
                 texts.append(doc.page_content)
 
+            # Check if we have any text to process
+            if not texts:
+                logger.warning("No text could be extracted from the document")
+                return {
+                    "chunks": [],
+                    "embeddings": [],
+                    "count": 0,
+                    "warning": "No text could be extracted from the document"
+                }
+
+            logger.info(f"Generating embeddings for {len(texts)} chunks")
             # Batch embed all texts
             embeddings_list = embeddings.embed_documents(texts)
+            logger.info("Embedding generation complete")
 
             # Return structured response
             return {
@@ -98,17 +169,18 @@ async def process_document(
                 "embeddings": embeddings_list,
                 "count": len(documents),
             }
-
         finally:
             # Clean up temp file
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+                logger.info(f"Temporary file {temp_path} removed")
 
     except Exception as e:
+        logger.error(f"Error processing document: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=500, detail=f"Error processing document: {str(e)}"
         )
-
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
