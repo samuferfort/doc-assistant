@@ -1,4 +1,5 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+
+from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import tempfile
@@ -6,181 +7,294 @@ import os
 import traceback
 import logging
 from dotenv import load_dotenv
-from typing import Optional
+from typing import Optional, Dict, Any, List
 import json
 from langchain_unstructured.document_loaders import UnstructuredLoader
 from langchain_openai import OpenAIEmbeddings
 import pypdf
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+import boto3 
+from botocore.exceptions import ClientError
+import httpx    
+from pydantic import BaseModel 
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, 
+# --- Logging ---
+logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load environment variables
+# --- Load Environment Variables ---
 load_dotenv()
 
-# Initialize FastAPI app
+# --- Initialize Clients ---
 app = FastAPI(title="Document Processor")
 
-# Add CORS middleware for Next.js
+try:
+    embeddings = OpenAIEmbeddings(
+        api_key=os.getenv("OPENAI_API_KEY"), model="text-embedding-3-small"
+    )
+    s3_client = boto3.client(
+        's3',
+        region_name=os.getenv("AWS_S3_REGION"),
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+    )
+    S3_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME")
+    NEXTJS_CALLBACK_URL = os.getenv("NEXTJS_CALLBACK_URL")
+    PYTHON_SERVICE_SECRET = os.getenv("PYTHON_SERVICE_SECRET")
+
+    # Validate essential environment variables
+    if not all([os.getenv("OPENAI_API_KEY"), os.getenv("AWS_ACCESS_KEY_ID"), os.getenv("AWS_SECRET_ACCESS_KEY"), S3_BUCKET_NAME, NEXTJS_CALLBACK_URL, PYTHON_SERVICE_SECRET]):
+        logger.critical("CRITICAL: Missing one or more required environment variables!")
+        # You might want to exit here in a real deployment
+        # sys.exit("Missing environment variables")
+
+except Exception as e:
+    logger.critical(f"CRITICAL: Failed to initialize clients or load environment variables: {e}")
+    # sys.exit("Initialization failed")
+
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with your Vercel URL in production
+    allow_origins=["*"], # TODO: Restrict this in production to your Next.js app's URL
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["POST", "GET"], # Limit methods if needed
     allow_headers=["*"],
 )
 
-# Initialize OpenAI embeddings
-embeddings = OpenAIEmbeddings(
-    api_key=os.getenv("OPENAI_API_KEY"), model="text-embedding-3-small"
-)
+# --- Pydantic Model for Request Body ---
+class ProcessRequest(BaseModel):
+    s3_key: str
+    document_id: str
+    # Add other fields if Next.js sends them (e.g., original filename for metadata)
+    # filename: Optional[str] = None
 
-@app.get("/health")
-async def health_check():
-    """Check if the service is running"""
-    return {"status": "healthy"}
-
+# --- Helper Functions ---
 def extract_text_with_pypdf(file_path):
     """Extract text using PyPDF as a fallback method"""
-    logger.info("Attempting text extraction with PyPDF")
+    logger.info(f"Attempting text extraction with PyPDF for {file_path}")
     try:
         reader = pypdf.PdfReader(file_path)
         text = ""
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
-                text += page_text + "\n\n"
+                text += page_text + "\n\n" # Add separator between pages
+        logger.info(f"PyPDF extracted approx {len(text)} characters.")
         return text
     except Exception as e:
         logger.error(f"PyPDF extraction error: {str(e)}")
         return ""
 
+async def notify_nextjs(document_id: str, success: bool, error_message: Optional[str] = None):
+    """Sends completion status back to the Next.js API route."""
+    if not NEXTJS_CALLBACK_URL or not PYTHON_SERVICE_SECRET:
+        logger.error("Callback URL or Secret not configured. Cannot notify Next.js.")
+        return
+
+    payload = {
+        "document_id": document_id,
+        "success": success,
+        "error_message": error_message if not success else None
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Processing-Secret": PYTHON_SERVICE_SECRET # Authentication header
+    }
+    logger.info(f"Attempting to notify Next.js at {NEXTJS_CALLBACK_URL} for doc {document_id}, success={success}")
+
+    async with httpx.AsyncClient(timeout=30.0) as client: # Add a timeout
+        try:
+            response = await client.post(NEXTJS_CALLBACK_URL, json=payload, headers=headers)
+            response.raise_for_status() # Check for 4xx/5xx errors
+            logger.info(f"Successfully notified Next.js for document {document_id}. Status: {success}. Response: {response.status_code}")
+        except httpx.RequestError as e:
+            logger.error(f"HTTP Request error notifying Next.js for document {document_id}: {e}")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP Status error notifying Next.js for document {document_id}: {e.response.status_code} - {e.response.text}")
+        except Exception as e:
+            logger.error(f"Unexpected error notifying Next.js for document {document_id}: {e}")
+            logger.error(traceback.format_exc())
+
+
+# --- API Endpoints ---
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
 @app.post("/process")
-async def process_document(
-    file: UploadFile = File(...),
-    project_id: Optional[str] = Form(None),
-    metadata: Optional[str] = Form(None),
-    strategy: str = Form(default="fast", regex="^(fast|hi_res)$"),
-):
-    """Process a PDF into chunks and embeddings for Next.js to store in Pinecone"""
-    # Parse metadata if provided
-    metadata_dict = {}
-    if metadata:
-        try:
-            metadata_dict = json.loads(metadata)
-        except json.JSONDecodeError:
-            metadata_dict = {}
+async def process_document(payload: ProcessRequest):
+    """
+    Download doc from S3, process into chunks/embeddings,
+    upload results to S3, and trigger indexing via Next.js callback.
+    """
+    s3_key = payload.s3_key
+    document_id = payload.document_id
+    # Extract original filename from key if needed, assuming format folder/uuid-filename.ext
+    original_filename = s3_key.split('-')[-1] if '-' in s3_key else s3_key.split('/')[-1]
 
-    # Add project_id and filename to metadata
-    if project_id:
-        metadata_dict["project_id"] = project_id
-    metadata_dict["filename"] = file.filename
+    logger.info(f"Received processing request for document_id: {document_id}, s3_key: {s3_key}")
 
+    temp_path = None
     try:
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=os.path.splitext(file.filename)[1]
-        ) as temp:
-            content = await file.read()
-            temp.write(content)
+        # 1. Download file from S3
+        _, ext = os.path.splitext(s3_key)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext or ".tmp") as temp:
             temp_path = temp.name
-
-        try:
-            logger.info(f"Processing file: {file.filename} with strategy: {strategy}")
-            logger.info(f"Temp file path: {temp_path}")
-            
-            documents = []
-            
-            # First try with UnstructuredLoader
+            logger.info(f"Downloading s3://{S3_BUCKET_NAME}/{s3_key} to {temp_path}")
             try:
-                loader = UnstructuredLoader(
-                    temp_path,
-                    strategy=strategy,
-                    chunking_strategy="by_title",
-                    max_characters=2000,
-                    new_after_n_chars=1500,
+                s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_path)
+                logger.info(f"S3 download successful for {document_id}.")
+            except ClientError as e:
+                 error_code = e.response.get("Error", {}).get("Code")
+                 error_message = f"S3 Download error: {e}"
+                 if error_code == '404': # Check for Not Found specifically
+                     error_message = f"S3 Key not found: {s3_key}"
+                     logger.error(error_message)
+                     await notify_nextjs(document_id, success=False, error_message=error_message)
+                     raise HTTPException(status_code=404, detail=error_message)
+                 else:
+                     logger.error(error_message)
+                     await notify_nextjs(document_id, success=False, error_message=error_message)
+                     raise HTTPException(status_code=500, detail=error_message)
+
+        # 2. Extract Text & Chunk
+        logger.info(f"Processing downloaded file: {temp_path} for doc: {document_id}")
+        documents: List[Document] = []
+        # Base metadata to add to all chunks
+        base_metadata = {"document_id": document_id, "original_filename": original_filename}
+        # Add folderId if it's part of the s3_key structure (e.g., "folderId/uuid-name.pdf")
+        key_parts = s3_key.split('/')
+        if len(key_parts) > 1 and key_parts[0] != 'root':
+             base_metadata["folder_id"] = key_parts[0]
+        else:
+             base_metadata["folder_id"] = "root" # Explicitly mark root
+
+
+        # Try Unstructured (consider making strategy configurable via payload if needed)
+        try:
+            loader = UnstructuredLoader(temp_path, strategy="fast") # Or "hi_res"
+            loaded_docs = loader.load() # Unstructured chunks internally
+            if loaded_docs:
+                 # Add base metadata to unstructured chunks
+                 for doc in loaded_docs:
+                     doc.metadata.update(base_metadata)
+                 documents = loaded_docs
+                 logger.info(f"Unstructured loaded {len(documents)} chunks for doc: {document_id}.")
+            else:
+                 logger.info(f"UnstructuredLoader returned no chunks for doc: {document_id}.")
+        except Exception as loader_error:
+            logger.warning(f"UnstructuredLoader failed for doc {document_id}: {loader_error}. Trying PyPDF.")
+
+        # Fallback to PyPDF
+        if not documents:
+            extracted_text_pypdf = extract_text_with_pypdf(temp_path)
+            if extracted_text_pypdf:
+                logger.info(f"PyPDF extracted text for doc {document_id}. Splitting...")
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=150,
+                    separators=["\n\n", "\n", ". ", "? ", "! ", " ", ""],
+                    length_function=len,
                 )
-                logger.info("UnstructuredLoader initialized successfully")
-                
-                documents = loader.load()
-                logger.info(f"Document loading complete. Extracted {len(documents)} chunks.")
-                
-            except Exception as loader_error:
-                logger.error(f"Error during document loading: {str(loader_error)}")
-                logger.error(traceback.format_exc())
-            
-            # If UnstructuredLoader failed or returned no chunks, try PyPDF
-            if len(documents) == 0:
-                logger.info("UnstructuredLoader returned no chunks, trying PyPDF fallback")
-                extracted_text = extract_text_with_pypdf(temp_path)
-                
-                if extracted_text:
-                    logger.info(f"PyPDF extracted {len(extracted_text)} characters")
-                    
-                    # Split the text into chunks
-                    text_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=2000,
-                        chunk_overlap=200,
-                        separators=["\n\n", "\n", " ", ""]
-                    )
-                    
-                    # Create document chunks
-                    from langchain_core.documents import Document
-                    full_doc = Document(page_content=extracted_text, metadata=metadata_dict)
-                    documents = text_splitter.split_documents([full_doc])
-                    
-                    logger.info(f"Split into {len(documents)} chunks using text splitter")
-                else:
-                    logger.warning("PyPDF fallback also failed to extract text")
+                # Create a single Document object with base metadata for splitting
+                full_doc_obj = Document(page_content=extracted_text_pypdf, metadata=base_metadata)
+                documents = text_splitter.split_documents([full_doc_obj])
+                logger.info(f"Split into {len(documents)} chunks using text splitter for doc: {document_id}.")
+            else:
+                logger.warning(f"PyPDF fallback also failed for doc {document_id}. No text extracted.")
+                await notify_nextjs(document_id, success=False, error_message="Failed to extract text from document.")
+                # Decide: Raise error or allow "empty" success? Let's raise for clarity.
+                raise HTTPException(status_code=400, detail="Failed to extract text from document.")
 
-            # Prepare chunks and batch embeddings
-            chunks = []
-            texts = []
-            for i, doc in enumerate(documents):
-                doc.metadata.update(metadata_dict)
-                # Add a unique chunk ID for Pinecone
-                chunk_id = f"{project_id}_{file.filename}_{i}"
-                chunks.append(
-                    {"id": chunk_id, "text": doc.page_content, "metadata": doc.metadata}
-                )
-                texts.append(doc.page_content)
+        # 3. Prepare for Embedding & S3 Upload of Results
+        chunks_for_json = []
+        texts_to_embed = []
 
-            # Check if we have any text to process
-            if not texts:
-                logger.warning("No text could be extracted from the document")
-                return {
-                    "chunks": [],
-                    "embeddings": [],
-                    "count": 0,
-                    "warning": "No text could be extracted from the document"
-                }
+        if not documents:
+             logger.warning(f"No document chunks generated for doc: {document_id}.")
+             await notify_nextjs(document_id, success=True, error_message="Document processed but contained no text chunks.")
+             return {"message": f"Document {document_id} processed, no text chunks found."}
 
-            logger.info(f"Generating embeddings for {len(texts)} chunks")
-            # Batch embed all texts
-            embeddings_list = embeddings.embed_documents(texts)
-            logger.info("Embedding generation complete")
+        for i, doc in enumerate(documents):
+            chunk_text = doc.page_content
+            # Metadata already contains document_id, folder_id, filename from base_metadata
+            chunk_metadata = doc.metadata
+            chunk_metadata["chunk_index"] = i # Add chunk index
 
-            # Return structured response
-            return {
-                "chunks": chunks,
-                "embeddings": embeddings_list,
-                "count": len(documents),
-            }
-        finally:
-            # Clean up temp file
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-                logger.info(f"Temporary file {temp_path} removed")
+            # Pinecone ID: Ensure it's unique and valid ASCII
+            # Consider sanitizing if document_id or i could be problematic, though cuid + index should be safe
+            chunk_id = f"{document_id}_chunk_{i}"
 
+            chunks_for_json.append({
+                "id": chunk_id,              # ID for the Pinecone vector
+                "text": chunk_text,          # Text content of the chunk
+                "metadata": chunk_metadata,  # Metadata for Pinecone vector
+            })
+            texts_to_embed.append(chunk_text)
+
+        # 4. Generate Embeddings
+        logger.info(f"Generating embeddings for {len(texts_to_embed)} chunks for doc: {document_id}...")
+        try:
+            embeddings_list = embeddings.embed_documents(texts_to_embed)
+            logger.info(f"Embedding generation complete for doc: {document_id}.")
+        except Exception as embed_error:
+            logger.error(f"Embedding generation failed for doc {document_id}: {embed_error}")
+            await notify_nextjs(document_id, success=False, error_message=f"Embedding generation failed: {embed_error}")
+            raise HTTPException(status_code=500, detail=f"Embedding generation failed: {embed_error}")
+
+        # 5. Upload Processed Data (JSON with chunks/embeddings) back to S3
+        processed_data = {
+            "document_id": document_id,
+            "chunks_with_metadata": chunks_for_json, # Contains ID, text, metadata
+            "embeddings": embeddings_list            # List of vectors
+        }
+        processed_data_key = f"processed/{document_id}.json"
+        logger.info(f"Uploading processed data for doc {document_id} to s3://{S3_BUCKET_NAME}/{processed_data_key}")
+        try:
+            s3_client.put_object(
+                Bucket=S3_BUCKET_NAME,
+                Key=processed_data_key,
+                Body=json.dumps(processed_data), # Serialize dict to JSON string
+                ContentType='application/json'
+            )
+            logger.info(f"Successfully uploaded processed data for doc {document_id}")
+
+            # 6. Notify Next.js of SUCCESS (Now Next.js knows where to get data)
+            await notify_nextjs(document_id, success=True)
+
+            return {"message": f"Processing complete for {document_id}. Processed data at {processed_data_key}"}
+
+        except ClientError as e:
+            error_message = f"Failed to upload processed data to S3 for doc {document_id}: {e}"
+            logger.error(error_message)
+            await notify_nextjs(document_id, success=False, error_message=error_message)
+            raise HTTPException(status_code=500, detail=error_message)
+
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions (like 404, 400) to return correct status codes
+        raise http_exc
     except Exception as e:
-        logger.error(f"Error processing document: {str(e)}")
+        # Catch-all for unexpected errors during the whole process
+        error_message = f"Unexpected error processing document {document_id}: {str(e)}"
+        logger.error(error_message)
         logger.error(traceback.format_exc())
-        raise HTTPException(
-            status_code=500, detail=f"Error processing document: {str(e)}"
-        )
+        await notify_nextjs(document_id, success=False, error_message=error_message)
+        raise HTTPException(status_code=500, detail=error_message)
+    finally:
+        # Clean up downloaded temp file
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+                logger.info(f"Temporary file {temp_path} removed for doc {document_id}")
+            except Exception as cleanup_error:
+                 logger.error(f"Error removing temp file {temp_path} for doc {document_id}: {cleanup_error}")
 
+# --- Run the App ---
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", 8000)) # Default to 8000 if PORT not set
+    logger.info(f"Starting Uvicorn server on 0.0.0.0:{port}")
+    # Use reload=True only for local development
+    # uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # For deployment

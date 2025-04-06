@@ -20,3 +20,6 @@ docx2txt>=0.8
 protobuf==6.30.0
 onnx>=1.15.0
 onnxruntime==1.21.0
+boto3         # <--- Add for AWS S3
+httpx         # <--- Add for HTTP callbacks
+pydantic
