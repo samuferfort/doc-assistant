@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -172,22 +171,34 @@ async def process_document(payload: ProcessRequest):
              base_metadata["folder_id"] = "root" # Explicitly mark root
 
 
-        # Try Unstructured (consider making strategy configurable via payload if needed)
-        try:
-            loader = UnstructuredLoader(temp_path, strategy="fast") # Or "hi_res"
-            loaded_docs = loader.load() # Unstructured chunks internally
-            if loaded_docs:
-                 # Add base metadata to unstructured chunks
-                 for doc in loaded_docs:
-                     doc.metadata.update(base_metadata)
-                 documents = loaded_docs
-                 logger.info(f"Unstructured loaded {len(documents)} chunks for doc: {document_id}.")
-            else:
-                 logger.info(f"UnstructuredLoader returned no chunks for doc: {document_id}.")
-        except Exception as loader_error:
-            logger.warning(f"UnstructuredLoader failed for doc {document_id}: {loader_error}. Trying PyPDF.")
+        # --- MINIMAL CHANGE START ---
+        # Introduce a flag to easily switch between strategies later if needed
+        # Set to False to always skip Unstructured and use PyPDF fallback
+        USE_UNSTRUCTURED_LOADER = False
 
-        # Fallback to PyPDF
+        if USE_UNSTRUCTURED_LOADER:
+            # Try Unstructured (consider making strategy configurable via payload if needed)
+            try:
+                # Change strategy here if you want to re-enable Unstructured later
+                loader = UnstructuredLoader(temp_path, strategy="hi_res") # or "fast"
+                loaded_docs = loader.load() # Unstructured chunks internally
+                if loaded_docs:
+                     # Add base metadata to unstructured chunks
+                     for doc in loaded_docs:
+                         doc.metadata.update(base_metadata)
+                     documents = loaded_docs
+                     logger.info(f"Unstructured loaded {len(documents)} chunks for doc: {document_id}.")
+                else:
+                     logger.info(f"UnstructuredLoader returned no chunks for doc: {document_id}.")
+            except Exception as loader_error:
+                logger.warning(f"UnstructuredLoader failed for doc {document_id}: {loader_error}. Trying PyPDF.")
+                # If Unstructured fails, 'documents' remains empty, forcing the fallback below.
+        # --- MINIMAL CHANGE END ---
+
+
+        # Fallback to PyPDF (This will now always run if USE_UNSTRUCTURED_LOADER is False)
+        # If USE_UNSTRUCTURED_LOADER was False, 'documents' is still [], so this block executes.
+        # If USE_UNSTRUCTURED_LOADER was True but failed or returned no chunks, this block also executes.
         if not documents:
             extracted_text_pypdf = extract_text_with_pypdf(temp_path)
             if extracted_text_pypdf:
