@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for document-processor-little-hill-971 on 2025-03-20T10:09:56+01:00
+# fly.toml app configuration file generated for doc-assistant on 2025-04-16T08:52:00Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'document-processor-little-hill-971'
+app = 'doc-assistant'
 primary_region = 'mad'
 
 [build]
@@ -20,3 +20,4 @@ primary_region = 'mad'
   memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 1024
