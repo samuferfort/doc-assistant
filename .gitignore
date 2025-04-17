@@ -1,5 +1,6 @@
 .env
 venv/
+doc-assitant-env/
 __pycache__/
 *.pyc
 *.pyo
